@@ -1,0 +1,12 @@
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python main.py"
+
+[environment]
+TELEGRAM_BOT_TOKEN = "7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk"
+IOTEX_RPC_URL = "https://api.iotex.me/api/graphql"
+CONFIRMATIONS = "3"
+POLL_INTERVAL_SEC = "4"
+TZ = "Africa/Lagos"
