@@ -1,4 +1,7 @@
 requests==2.31.0
+<<<<<<< HEAD
 flask==2.3.3
 pytz==2023.3
 python-dotenv==1.0.0
+=======
+>>>>>>> 090a6372a7df9bcd68c05a3dc7be4a82e9bd21a9
