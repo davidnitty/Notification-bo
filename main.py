@@ -1,6 +1,5 @@
 import os
-import asyncio
-from telegram.ext import Application, CommandHandler
+import telebot
 import requests
 import logging
 
@@ -8,31 +7,27 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Your bot token from environment variable
-TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+# Your bot token - try environment variable first, then fallback to direct token
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk')
 
-async def start(update, context):
-    await update.message.reply_text('Hello! Bot is running on Railway!')
+if not TOKEN:
+    logger.error("No TELEGRAM_BOT_TOKEN found!")
+    exit(1)
 
-async def check_transaction(update, context):
-    # Your transaction checking logic here
-    await update.message.reply_text('Checking transactions...')
+bot = telebot.TeleBot(TOKEN)
 
-def main():
-    if not TOKEN:
-        logger.error("No TELEGRAM_BOT_TOKEN found in environment variables")
-        return
-    
-    # Create Application
-    application = Application.builder().token(TOKEN).build()
-    
-    # Add handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("check", check_transaction))
-    
-    # Start the bot
-    logger.info("Starting bot...")
-    application.run_polling()
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    bot.reply_to(message, "Hello! Bot is running on Railway!")
 
-if __name__ == '__main__':
-    main()
+@bot.message_handler(commands=['check'])
+def check_transaction(message):
+    bot.reply_to(message, "Checking transactions...")
+
+@bot.message_handler(func=lambda message: True)
+def echo_all(message):
+    bot.reply_to(message, "I received your message!")
+
+logger.info("Starting bot polling...")
+logger.info(f"Bot token: {TOKEN[:10]}...")  # Log first 10 chars for verification
+bot.infinity_polling()
