@@ -8,14 +8,22 @@ import re
 import random
 from datetime import datetime
 from threading import Thread
+from flask import Flask, request, jsonify
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Your bot token
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk")
-TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+# Configuration
+class Config:
+    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk")
+    IOTEX_RPC_URL = os.getenv("IOTEX_RPC_URL", "https://api.iotex.me/api/graphql")
+    CONFIRMATIONS = int(os.getenv("CONFIRMATIONS", "3"))
+    POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "4"))
+    TIMEZONE = os.getenv("TZ", "Africa/Lagos")
+    
+    TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    EXPLORER_BASE = "https://iotexscan.io"
 
 class AddressUtils:
     @staticmethod
@@ -36,41 +44,26 @@ class AddressUtils:
 
 class Storage:
     def __init__(self, db_path: str = "bot_data.db"):
-        # Use current directory for Railway compatibility
         self.db_path = db_path
         self._init_db()
     
     def _init_db(self) -> None:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
-        # First, check if the table exists and has the correct schema
-        cursor.execute("PRAGMA table_info(users)")
-        columns = [column[1] for column in cursor.fetchall()]
-        
-        # Create table if it doesn't exist
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY,
                 address TEXT NOT NULL,
                 preferences TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                is_active BOOLEAN DEFAULT TRUE
+                is_active BOOLEAN DEFAULT TRUE,
+                last_alert_sent TEXT DEFAULT NULL,
+                total_alerts INTEGER DEFAULT 0
             )
         ''')
-        
-        # Add missing columns if they don't exist
-        if 'last_alert_sent' not in columns:
-            cursor.execute('ALTER TABLE users ADD COLUMN last_alert_sent TEXT DEFAULT NULL')
-            logger.info("Added last_alert_sent column")
-        
-        if 'total_alerts' not in columns:
-            cursor.execute('ALTER TABLE users ADD COLUMN total_alerts INTEGER DEFAULT 0')
-            logger.info("Added total_alerts column")
-        
         conn.commit()
         conn.close()
-        logger.info("Database initialized with correct schema")
+        logger.info("Database initialized")
     
     def save_user(self, chat_id: int, address: str, is_active: bool = True) -> None:
         conn = sqlite3.connect(self.db_path)
@@ -248,9 +241,10 @@ class IoTeXMonitor:
 class TelegramBot:
     def __init__(self):
         self.storage = Storage()
+        self.base_url = Config.TELEGRAM_API_BASE
     
     def send_message(self, chat_id: int, text: str, parse_mode: str = "Markdown") -> bool:
-        url = f"{TELEGRAM_API_BASE}/sendMessage"
+        url = f"{self.base_url}/sendMessage"
         payload = {
             "chat_id": chat_id,
             "text": text,
@@ -264,8 +258,14 @@ class TelegramBot:
             logger.error(f"Send error: {e}")
             return False
     
-    def process_message(self, chat_id: int, text: str) -> None:
-        text = text.strip()
+    def process_update(self, update: dict) -> None:
+        if "message" not in update:
+            return
+        
+        message = update["message"]
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+        
         logger.info(f"Processing: '{text}' from {chat_id}")
         
         if text.lower() in ['/start', '/start@dustpin_bot']:
@@ -436,82 +436,90 @@ Monitoring active!"""
 🟢 Status: Active"""
         self.send_message(chat_id, stats_message)
 
-def get_bot_info():
-    """Check if bot token is valid"""
-    url = f"{TELEGRAM_API_BASE}/getMe"
+# Flask App for Railway
+app = Flask(__name__)
+bot = TelegramBot()
+monitor = IoTeXMonitor()
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Telegram webhook endpoint"""
+    update = request.get_json()
+    logger.info("Received webhook update")
+    
     try:
-        response = requests.get(url, timeout=10)
-        data = response.json()
-        if data.get('ok'):
-            bot_info = data['result']
-            logger.info(f"✅ Bot: @{bot_info['username']} ({bot_info['first_name']})")
-            return True
-        else:
-            logger.error(f"❌ Invalid token: {data}")
-            return False
+        bot.process_update(update)
+        return jsonify({"status": "ok"})
     except Exception as e:
-        logger.error(f"❌ Bot check error: {e}")
-        return False
+        logger.error(f"Webhook error: {e}")
+        return jsonify({"status": "error"}), 500
+
+@app.route('/set_webhook', methods=['GET'])
+def set_webhook():
+    """Auto-set webhook on Railway"""
+    webhook_url = f"https://{request.host}/webhook"
+    url = f"{Config.TELEGRAM_API_BASE}/setWebhook"
+    payload = {"url": webhook_url}
+    
+    try:
+        response = requests.post(url, json=payload)
+        if response.json().get('ok'):
+            return jsonify({
+                "status": "success", 
+                "webhook_url": webhook_url,
+                "message": "✅ Webhook set successfully! Your bot is now live on Railway!"
+            })
+        else:
+            return jsonify({"status": "error", "message": response.json()}), 500
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/', methods=['GET'])
+def home():
+    return jsonify({
+        "status": "running", 
+        "service": "iotex-alert-bot",
+        "version": "2.0.0",
+        "platform": "Railway",
+        "monitoring_interval": "4 seconds"
+    })
+
+@app.route('/healthz', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy"})
 
 def start_monitoring():
     """Start monitoring in background"""
-    monitor = IoTeXMonitor()
-    logger.info("🚀 Starting IoTeX monitoring (4s intervals)...")
+    logger.info("🚀 Starting IoTeX monitoring on Railway (4s intervals)...")
     while True:
         try:
             monitor.check_all_users()
             time.sleep(4)
         except Exception as e:
-            logger.error(f"Monitor error: {e}")
+            logger.error(f"Monitoring error: {e}")
             time.sleep(2)
 
-def poll_updates():
-    """Poll for Telegram updates"""
-    bot = TelegramBot()
-    offset = None
-    
-    logger.info("🤖 Starting IoTeX Bot (POLLING MODE)...")
-    
-    # Check bot token
-    if not get_bot_info():
-        logger.error("❌ Check bot token with @BotFather")
-        return
-    
-    logger.info("✅ Bot ready! Message your bot on Telegram...")
-    
+def main():
+    """Main application entry point"""
     # Start monitoring thread
     monitor_thread = Thread(target=start_monitoring, daemon=True)
     monitor_thread.start()
     
-    # Poll for messages
-    while True:
-        try:
-            url = f"{TELEGRAM_API_BASE}/getUpdates"
-            params = {'timeout': 30}
-            if offset:
-                params['offset'] = offset
-                
-            response = requests.get(url, params=params, timeout=35)
-            data = response.json()
-            
-            if data.get('ok'):
-                for update in data['result']:
-                    offset = update['update_id'] + 1
-                    
-                    if 'message' in update:
-                        message = update['message']
-                        chat_id = message['chat']['id']
-                        text = message.get('text', '').strip()
-                        
-                        if text:
-                            logger.info(f"📨 From {chat_id}: {text}")
-                            bot.process_message(chat_id, text)
-            
-            time.sleep(1)
-            
-        except Exception as e:
-            logger.error(f"Polling error: {e}")
-            time.sleep(5)
+    # Auto-set webhook on startup
+    try:
+        with app.app_context():
+            webhook_url = f"https://{os.getenv('RAILWAY_STATIC_URL', 'localhost')}/webhook"
+            if not webhook_url.startswith("https://localhost"):
+                response = requests.post(f"{Config.TELEGRAM_API_BASE}/setWebhook", json={"url": webhook_url})
+                if response.json().get('ok'):
+                    logger.info(f"✅ Webhook auto-configured: {webhook_url}")
+    except Exception as e:
+        logger.info(f"Webhook setup: {e}")
+    
+    # Start Flask app
+    port = int(os.getenv('PORT', 8080))
+    logger.info(f"🌐 Starting IoTeX Bot on port {port}")
+    app.run(host='0.0.0.0', port=port, debug=False)
 
 if __name__ == '__main__':
-    poll_updates()
+    main()
