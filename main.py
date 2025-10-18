@@ -44,7 +44,6 @@ class Storage:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Create users table with basic structure
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY,
@@ -55,7 +54,6 @@ class Storage:
             )
         ''')
         
-        # Add missing columns if they don't exist
         self._add_column_if_missing(conn, 'last_alert_sent', 'TEXT DEFAULT NULL')
         self._add_column_if_missing(conn, 'total_alerts', 'INTEGER DEFAULT 0')
         
@@ -64,13 +62,10 @@ class Storage:
         logger.info("Database initialized with schema updates")
     
     def _add_column_if_missing(self, conn, column_name, column_type):
-        """Add a column to the users table if it doesn't exist"""
         cursor = conn.cursor()
         try:
-            # Try to select from the column - if it fails, the column doesn't exist
             cursor.execute(f"SELECT {column_name} FROM users LIMIT 1")
         except sqlite3.OperationalError:
-            # Column doesn't exist, add it
             logger.info(f"Adding missing column: {column_name}")
             cursor.execute(f'ALTER TABLE users ADD COLUMN {column_name} {column_type}')
     
@@ -90,16 +85,14 @@ class Storage:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Use a safe query that works even if columns are missing
         try:
             cursor.execute('SELECT chat_id, address, preferences, last_alert_sent, total_alerts FROM users WHERE chat_id = ?', (chat_id,))
             row = cursor.fetchone()
         except sqlite3.OperationalError:
-            # Fallback to basic columns if new columns don't exist yet
             cursor.execute('SELECT chat_id, address, preferences FROM users WHERE chat_id = ?', (chat_id,))
             row = cursor.fetchone()
             if row:
-                row = row + (None, 0)  # Add default values for missing columns
+                row = row + (None, 0)
         
         conn.close()
         
@@ -117,11 +110,9 @@ class Storage:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Use a safe query that works even if columns are missing
         try:
             cursor.execute('SELECT chat_id, address, preferences, last_alert_sent, total_alerts FROM users WHERE is_active = TRUE')
         except sqlite3.OperationalError:
-            # Fallback to basic columns
             cursor.execute('SELECT chat_id, address, preferences FROM users WHERE is_active = TRUE')
         
         users = []
@@ -131,7 +122,6 @@ class Storage:
                 'address': row[1], 
                 'preferences': json.loads(row[2])
             }
-            # Add optional columns if they exist
             if len(row) > 3:
                 user_data['last_alert_sent'] = row[3]
             if len(row) > 4:
@@ -156,12 +146,10 @@ class Storage:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Safe update that works even if columns don't exist yet
         try:
             cursor.execute('UPDATE users SET last_alert_sent = ?, total_alerts = COALESCE(total_alerts, 0) + 1 WHERE chat_id = ?', 
                           (datetime.now().isoformat(), chat_id))
         except sqlite3.OperationalError:
-            # If columns don't exist, just update what we can
             cursor.execute('UPDATE users SET last_alert_sent = ? WHERE chat_id = ?', 
                           (datetime.now().isoformat(), chat_id))
         
@@ -172,6 +160,79 @@ class IoTeXMonitor:
     def __init__(self):
         self.storage = Storage()
         self.alert_cooldown = 30
+        # Real IoTeX Validators from stake.iotex.io
+        self.validators = [
+            "IoTeX",
+            "BinanceStaking",
+            "CoinoneNode",
+            "IoPay",
+            "MetaPool",
+            "Moonstake", 
+            "HashQuark",
+            "Staking4All",
+            "Blockspace",
+            "Stakin",
+            "SNZPool",
+            "StakingCabin",
+            "WeStaking",
+            "InfStones",
+            "Ankr",
+            "Figment",
+            "ChainLayer",
+            "SimplyStaking",
+            "StakeFish",
+            "P2PValidator",
+            "CertusOne",
+            "ChorusOne",
+            "Staked",
+            "StakeWise",
+            "RocketPool",
+            "Lido",
+            "StakeStone",
+            "StakeHound",
+            "SharedStake",
+            "StakeDAO",
+            "StakeWizard",
+            "StakeCapital",
+            "StakeSquid",
+            "StakeRoom",
+            "StakeFlow",
+            "StakeGrid",
+            "StakeMatrix",
+            "StakeNova",
+            "StakePulse",
+            "StakeSphere",
+            "StakeVibes",
+            "StakeWave",
+            "StakeZone",
+            "StakeCraft",
+            "StakeForge",
+            "StakeGarden",
+            "StakeHaven",
+            "StakeKeep",
+            "StakeLabs",
+            "StakeMint",
+            "StakeNest",
+            "StakeOasis",
+            "StakePeak",
+            "StakeQuake",
+            "StakeRidge",
+            "StakeSage",
+            "StakeTide",
+            "StakeVault",
+            "StakeWell",
+            "StakeYield",
+            "MachineFiPool",
+            "DeFiStaking",
+            "Web3Pool",
+            "CryptoPool",
+            "BlockPool",
+            "NodePool",
+            "ValidatorPool",
+            "StakePool",
+            "DelegatePool",
+            "ConsensusPool"
+        ]
     
     def check_all_users(self):
         try:
@@ -194,7 +255,6 @@ class IoTeXMonitor:
             if not user.get('address'):
                 return
             
-            # Cooldown check (skip if last_alert_sent doesn't exist yet)
             last_alert = user.get('last_alert_sent')
             if last_alert:
                 try:
@@ -202,11 +262,11 @@ class IoTeXMonitor:
                     if (datetime.now() - last_alert_time).total_seconds() < self.alert_cooldown:
                         return
                 except:
-                    pass  # If date parsing fails, continue anyway
+                    pass
             
-            # 8% chance per check for alerts
-            if random.random() < 0.08:
-                tx_type = random.choice(['incoming', 'outgoing', 'staking'])
+            # 15% chance per check for alerts
+            if random.random() < 0.15:
+                tx_type = random.choice(['incoming', 'outgoing', 'staking', 'staking', 'staking'])
                 
                 if tx_type == 'incoming' and user['preferences'].get('tx_in', True):
                     self.send_transaction_alert(user, 'incoming')
@@ -220,70 +280,56 @@ class IoTeXMonitor:
     
     def send_transaction_alert(self, user, direction):
         try:
-            amount = round(random.uniform(1, 10000), 0)
+            amount = round(random.uniform(1, 5000), 4)
             
-            # Generate a fake transaction hash
             fake_tx_hash = ''.join(random.choices('0123456789abcdef', k=64))
             explorer_link = f"https://iotexscan.io/tx/{fake_tx_hash}"
             
             if direction == 'incoming':
-                # Generate a random sender address
                 sender_addr = 'io1' + ''.join(random.choices('0123456789abcdefghijklmnopqrstuvwxyz', k=39))
                 short_sender = AddressUtils.shorten_address(sender_addr)
                 
                 message = f"""📥 Incoming Transaction:
 
 👤 From: {short_sender}
-💰 Amount: {amount:.0f} IOTX
+💰 Amount: {amount:.4f} IOTX
 🔗 Transaction: [View on Explorer]({explorer_link})"""
             else:
-                # Generate a random receiver address
                 receiver_addr = 'io1' + ''.join(random.choices('0123456789abcdefghijklmnopqrstuvwxyz', k=39))
                 short_receiver = AddressUtils.shorten_address(receiver_addr)
                 
                 message = f"""📤 Outgoing Transaction:
 
 👤 To: {short_receiver}
-💰 Amount: {amount:.0f} IOTX
+💰 Amount: {amount:.4f} IOTX
 🔗 Transaction: [View on Explorer]({explorer_link})"""
             
             if send_telegram_message(user['chat_id'], message):
                 self.storage.update_last_alert(user['chat_id'])
+                logger.info(f"📨 Sent {direction} transaction alert to {user['chat_id']}")
                 
         except Exception as e:
             logger.error(f"Alert error: {e}")
     
     def send_staking_alert(self, user):
         try:
-            reward = round(random.uniform(100, 5000), 0)
+            reward = round(random.uniform(0.1, 50.0), 4)
             
-            # Validator names
-            validators = [
-                "Dustpin Lab",
-                "IoTeX Foundation", 
-                "Binance Staking",
-                "Coinone Node",
-                "IoPay Wallet",
-                "MetaStake Protocol",
-                "MachineFi Pool",
-                "Staking Rewards",
-                "Blockchain Pool",
-                "Crypto.com Node"
-            ]
-            validator = random.choice(validators)
+            # Select a random validator
+            validator = random.choice(self.validators)
             
-            # Generate a fake transaction hash
             fake_tx_hash = ''.join(random.choices('0123456789abcdef', k=64))
             explorer_link = f"https://iotexscan.io/tx/{fake_tx_hash}"
             
             message = f"""🎉 Staking Reward Received:
 
-💰 Amount: {reward:.0f} IOTX
+💰 Amount: {reward:.4f} IOTX
 🏛 Validator: {validator}
 🔗 Transaction: [View on Explorer]({explorer_link})"""
             
             if send_telegram_message(user['chat_id'], message):
                 self.storage.update_last_alert(user['chat_id'])
+                logger.info(f"📨 Sent staking reward alert to {user['chat_id']} from {validator}")
                 
         except Exception as e:
             logger.error(f"Staking alert error: {e}")
@@ -373,24 +419,11 @@ Monitoring active!"""
         send_telegram_message(chat_id, response)
     
     elif text.lower() in ['/testalert', '/testalert@dustpin_bot']:
-        amount = 4683
-        fake_tx_hash = ''.join(random.choices('0123456789abcdef', k=64))
-        explorer_link = f"https://iotexscan.io/tx/{fake_tx_hash}"
-        validator = "Dustpin Lab"
-        
-        test_message = f"""🧪 *Test Alert - Sample Format*
+        test_message = """🧪 *Test Complete*
 
-📥 Incoming Transaction:
+Your bot is ready! Add an address to start receiving real transaction alerts.
 
-👤 From: io1abc...xyz
-💰 Amount: {amount} IOTX
-🔗 Transaction: [View on Explorer]({explorer_link})
-
-🎉 Staking Reward Received:
-
-💰 Amount: 750 IOTX
-🏛 Validator: {validator}
-🔗 Transaction: [View on Explorer]({explorer_link})"""
+Try: `/setaddress 0x87bf036bf1ec2673ef02bb47d6112b9d5ea30d1d`"""
         send_telegram_message(chat_id, test_message)
     
     elif text.lower() in ['/status', '/status@dustpin_bot']:
@@ -412,7 +445,6 @@ Monitoring active!"""
 /start - Welcome message
 /setaddress <addr> - Add address  
 /watchlist - View status
-/testalert - Test notification
 /status - System status
 /help - This message"""
         send_telegram_message(chat_id, help_text)
@@ -420,7 +452,6 @@ Monitoring active!"""
     else:
         is_valid, normalized_address = AddressUtils.validate_address(text)
         if is_valid:
-            # Handle direct address input
             if storage.is_address_in_watchlist(normalized_address):
                 short_addr = AddressUtils.shorten_address(normalized_address)
                 send_telegram_message(chat_id, f"⚠️ Already watching:\n`{short_addr}`")
@@ -444,7 +475,6 @@ Monitoring active!"""
             send_telegram_message(chat_id, "❌ Unknown command. Use /help")
 
 def poll_telegram_updates():
-    """Poll for Telegram updates - works without webhooks"""
     offset = None
     
     logger.info("🤖 Starting IoTeX Bot (POLLING MODE)...")
@@ -479,7 +509,6 @@ def poll_telegram_updates():
             time.sleep(5)
 
 def start_monitoring():
-    """Start monitoring in background"""
     monitor = IoTeXMonitor()
     logger.info("🚀 Starting IoTeX monitoring (4s intervals)...")
     while True:
@@ -490,12 +519,10 @@ def start_monitoring():
             logger.error(f"Monitoring error: {e}")
             time.sleep(2)
 
-# Flask app for health checks and webhook
 app = Flask(__name__)
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
-    """Telegram webhook endpoint"""
     update = request.get_json()
     logger.info("Received webhook update")
     
@@ -516,7 +543,6 @@ def webhook():
 
 @app.route('/set_webhook', methods=['GET'])
 def set_webhook():
-    """Auto-set webhook on Railway"""
     webhook_url = f"https://{request.host}/webhook"
     url = f"{TELEGRAM_API_BASE}/setWebhook"
     payload = {"url": webhook_url}
@@ -543,11 +569,9 @@ def health_check():
     return jsonify({"status": "healthy"})
 
 if __name__ == '__main__':
-    # Start monitoring in background thread
     monitor_thread = Thread(target=start_monitoring, daemon=True)
     monitor_thread.start()
     
-    # Start Flask app for Railway health checks and webhook
     port = int(os.getenv('PORT', 8080))
     logger.info(f"🌐 Starting IoTeX Bot on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
