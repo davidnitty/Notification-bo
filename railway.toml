@@ -2,11 +2,14 @@
 builder = "nixpacks"
 
 [deploy]
-startCommand = "python main.py"
+startCommand = "python bot.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
 
 [environment]
 TELEGRAM_BOT_TOKEN = "7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk"
-IOTEX_RPC_URL = "https://api.iotex.me/api/graphql"
+IOTEX_RPC_URL = "https://babel-api.mainnet.iotex.io"
 CONFIRMATIONS = "3"
-POLL_INTERVAL_SEC = "4"
+POLL_INTERVAL_SEC = "20"
 TZ = "Africa/Lagos"
+DB_PATH = "/app/data/iotex_bot.db"
