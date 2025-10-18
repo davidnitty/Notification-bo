@@ -1,624 +1,779 @@
 import os
+import json
 import time
 import logging
 import requests
-import json
-import sqlite3
-import re
-import random
+import hashlib
 from datetime import datetime
+from typing import Optional, Dict, List
+import sqlite3
 from threading import Thread
-from flask import Flask, request, jsonify
+import pytz
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Configuration
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk")
-TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
-IOTEX_API_URL = "https://api.iotex.me/api/graphql"
+BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk')
+IOTEX_RPC_URL = os.getenv('IOTEX_RPC_URL', 'https://babel-api.mainnet.iotex.io')
+IOTEX_GRAPHQL_URL = os.getenv('IOTEX_GRAPHQL_URL', 'https://analyser-api.iotex.io/graphql')
+CONFIRMATIONS = int(os.getenv('CONFIRMATIONS', '3'))
+POLL_INTERVAL_SEC = int(os.getenv('POLL_INTERVAL_SEC', '20'))
+TIMEZONE = pytz.timezone(os.getenv('TZ', 'Africa/Lagos'))
+DB_PATH = os.getenv('DB_PATH', 'iotex_bot.db')
 
-class AddressUtils:
-    @staticmethod
-    def validate_address(address: str):
-        address = address.strip()
-        if address.startswith('io') and re.match(r'^io[0-9a-z]{41}$', address):
-            return True, address.lower()
-        elif address.startswith('0x') and re.match(r'^0x[0-9a-fA-F]{40}$', address):
-            return True, address.lower()
-        else:
-            return False, None
-    
-    @staticmethod
-    def shorten_address(address: str, length: int = 8) -> str:
-        if len(address) <= length * 2:
-            return address
-        return f"{address[:length]}...{address[-length:]}"
+TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-class Storage:
-    def __init__(self, db_path: str = "bot_data.db"):
+class Database:
+    def __init__(self, db_path: str):
         self.db_path = db_path
-        self._init_db()
+        self.init_db()
     
-    def _init_db(self) -> None:
+    def init_db(self):
         conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        c = conn.cursor()
         
-        cursor.execute('''
+        # Users table
+        c.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY,
-                address TEXT NOT NULL,
-                preferences TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                is_active BOOLEAN DEFAULT TRUE
+                io_address TEXT,
+                eth_address TEXT,
+                alert_rewards INTEGER DEFAULT 1,
+                alert_tx_in INTEGER DEFAULT 1,
+                alert_tx_out INTEGER DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
-        self._add_column_if_missing(conn, 'last_alert_sent', 'TEXT DEFAULT NULL')
-        self._add_column_if_missing(conn, 'total_alerts', 'INTEGER DEFAULT 0')
-        self._add_column_if_missing(conn, 'last_checked_block', 'INTEGER DEFAULT 0')
+        # Processed transactions table (for deduplication)
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS processed_txs (
+                chat_id INTEGER,
+                tx_hash TEXT,
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, tx_hash)
+            )
+        ''')
+        
+        # Last seen blocks
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS last_blocks (
+                chat_id INTEGER PRIMARY KEY,
+                block_number INTEGER
+            )
+        ''')
         
         conn.commit()
         conn.close()
-        logger.info("Database initialized with schema updates")
     
-    def _add_column_if_missing(self, conn, column_name, column_type):
-        cursor = conn.cursor()
-        try:
-            cursor.execute(f"SELECT {column_name} FROM users LIMIT 1")
-        except sqlite3.OperationalError:
-            logger.info(f"Adding missing column: {column_name}")
-            cursor.execute(f'ALTER TABLE users ADD COLUMN {column_name} {column_type}')
+    def get_connection(self):
+        return sqlite3.connect(self.db_path)
     
-    def save_user(self, chat_id: int, address: str, is_active: bool = True) -> None:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        preferences = json.dumps({"rewards": True, "tx_in": True, "tx_out": True})
-        cursor.execute('''
-            INSERT OR REPLACE INTO users 
-            (chat_id, address, preferences, created_at, is_active, last_alert_sent, total_alerts, last_checked_block)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (chat_id, address, preferences, datetime.now().isoformat(), is_active, None, 0, 0))
+    def save_user(self, chat_id: int, io_address: str, eth_address: str):
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('''
+            INSERT OR REPLACE INTO users (chat_id, io_address, eth_address)
+            VALUES (?, ?, ?)
+        ''', (chat_id, io_address, eth_address))
         conn.commit()
         conn.close()
     
-    def get_user(self, chat_id: int):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute('SELECT chat_id, address, preferences, last_alert_sent, total_alerts, last_checked_block FROM users WHERE chat_id = ?', (chat_id,))
-            row = cursor.fetchone()
-        except sqlite3.OperationalError:
-            cursor.execute('SELECT chat_id, address, preferences FROM users WHERE chat_id = ?', (chat_id,))
-            row = cursor.fetchone()
-            if row:
-                row = row + (None, 0, 0)
-        
+    def get_user(self, chat_id: int) -> Optional[Dict]:
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT * FROM users WHERE chat_id = ?', (chat_id,))
+        row = c.fetchone()
         conn.close()
         
         if row:
             return {
-                'chat_id': row[0], 
-                'address': row[1], 
-                'preferences': json.loads(row[2]),
-                'last_alert_sent': row[3] if len(row) > 3 else None,
-                'total_alerts': row[4] if len(row) > 4 else 0,
-                'last_checked_block': row[5] if len(row) > 5 else 0
+                'chat_id': row[0],
+                'io_address': row[1],
+                'eth_address': row[2],
+                'alert_rewards': row[3],
+                'alert_tx_in': row[4],
+                'alert_tx_out': row[5]
             }
         return None
     
-    def get_all_active_users(self):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute('SELECT chat_id, address, preferences, last_alert_sent, total_alerts, last_checked_block FROM users WHERE is_active = TRUE')
-        except sqlite3.OperationalError:
-            cursor.execute('SELECT chat_id, address, preferences FROM users WHERE is_active = TRUE')
-        
-        users = []
-        for row in cursor.fetchall():
-            user_data = {
-                'chat_id': row[0], 
-                'address': row[1], 
-                'preferences': json.loads(row[2])
-            }
-            if len(row) > 3:
-                user_data['last_alert_sent'] = row[3]
-            if len(row) > 4:
-                user_data['total_alerts'] = row[4]
-            else:
-                user_data['total_alerts'] = 0
-            if len(row) > 5:
-                user_data['last_checked_block'] = row[5]
-            else:
-                user_data['last_checked_block'] = 0
-                
-            users.append(user_data)
-        
+    def get_all_users(self) -> List[Dict]:
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT * FROM users WHERE io_address IS NOT NULL')
+        rows = c.fetchall()
         conn.close()
-        return users
-    
-    def is_address_in_watchlist(self, address: str) -> bool:
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute('SELECT 1 FROM users WHERE LOWER(address) = LOWER(?) AND is_active = TRUE', (address,))
-        result = cursor.fetchone() is not None
-        conn.close()
-        return result
-    
-    def update_last_alert(self, chat_id: int):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
         
-        try:
-            cursor.execute('UPDATE users SET last_alert_sent = ?, total_alerts = COALESCE(total_alerts, 0) + 1 WHERE chat_id = ?', 
-                          (datetime.now().isoformat(), chat_id))
-        except sqlite3.OperationalError:
-            cursor.execute('UPDATE users SET last_alert_sent = ? WHERE chat_id = ?', 
-                          (datetime.now().isoformat(), chat_id))
-        
+        return [{
+            'chat_id': row[0],
+            'io_address': row[1],
+            'eth_address': row[2],
+            'alert_rewards': row[3],
+            'alert_tx_in': row[4],
+            'alert_tx_out': row[5]
+        } for row in rows]
+    
+    def delete_user(self, chat_id: int):
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('DELETE FROM users WHERE chat_id = ?', (chat_id,))
+        c.execute('DELETE FROM processed_txs WHERE chat_id = ?', (chat_id,))
+        c.execute('DELETE FROM last_blocks WHERE chat_id = ?', (chat_id,))
         conn.commit()
         conn.close()
     
-    def update_last_checked_block(self, chat_id: int, block_number: int):
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute('UPDATE users SET last_checked_block = ? WHERE chat_id = ?', 
-                          (block_number, chat_id))
-        except sqlite3.OperationalError:
-            pass  # Column might not exist yet
-        
+    def update_settings(self, chat_id: int, rewards: int, tx_in: int, tx_out: int):
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('''
+            UPDATE users 
+            SET alert_rewards = ?, alert_tx_in = ?, alert_tx_out = ?
+            WHERE chat_id = ?
+        ''', (rewards, tx_in, tx_out, chat_id))
+        conn.commit()
+        conn.close()
+    
+    def is_tx_processed(self, chat_id: int, tx_hash: str) -> bool:
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT 1 FROM processed_txs WHERE chat_id = ? AND tx_hash = ?',
+                  (chat_id, tx_hash))
+        exists = c.fetchone() is not None
+        conn.close()
+        return exists
+    
+    def mark_tx_processed(self, chat_id: int, tx_hash: str):
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('INSERT OR IGNORE INTO processed_txs (chat_id, tx_hash) VALUES (?, ?)',
+                  (chat_id, tx_hash))
+        conn.commit()
+        conn.close()
+    
+    def get_last_block(self, chat_id: int) -> Optional[int]:
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('SELECT block_number FROM last_blocks WHERE chat_id = ?', (chat_id,))
+        row = c.fetchone()
+        conn.close()
+        return row[0] if row else None
+    
+    def update_last_block(self, chat_id: int, block_number: int):
+        conn = self.get_connection()
+        c = conn.cursor()
+        c.execute('INSERT OR REPLACE INTO last_blocks (chat_id, block_number) VALUES (?, ?)',
+                  (chat_id, block_number))
         conn.commit()
         conn.close()
 
-class IoTeXAPI:
-    def __init__(self):
-        self.api_url = IOTEX_API_URL
-    
-    def get_latest_block(self):
-        """Get the latest block number from IoTeX"""
-        query = """
-        {
-            chain {
-                mostRecentBlock {
-                    height
-                }
-            }
-        }
-        """
+class AddressConverter:
+    @staticmethod
+    def io_to_eth(io_address: str) -> Optional[str]:
+        """Convert io address to 0x format"""
+        if not io_address.startswith('io'):
+            return None
+        
         try:
-            response = requests.post(self.api_url, json={'query': query}, timeout=10)
-            data = response.json()
-            return int(data['data']['chain']['mostRecentBlock']['height'])
-        except Exception as e:
-            logger.error(f"Error getting latest block: {e}")
+            import bech32
+            _, data = bech32.bech32_decode(io_address)
+            if data is None:
+                return None
+            decoded = bech32.convertbits(data, 5, 8, False)
+            if decoded is None or len(decoded) != 20:
+                return None
+            return '0x' + ''.join(f'{b:02x}' for b in decoded)
+        except:
+            # Fallback: simple conversion
             return None
     
-    def get_transactions_for_address(self, address: str, from_block: int, to_block: int):
-        """Get real transactions for an address from IoTeX blockchain"""
-        query = """
-        query GetTransactions($address: String!, $fromBlock: Int!, $toBlock: Int!) {
-            transactionsByAddress(address: $address, fromBlock: $fromBlock, toBlock: $toBlock) {
-                transactions {
-                    hash
-                    from
-                    to
-                    value
-                    block {
-                        height
-                        timestamp {
-                            seconds
-                        }
-                    }
-                }
-            }
-        }
-        """
-        
-        variables = {
-            "address": address,
-            "fromBlock": from_block,
-            "toBlock": to_block
-        }
+    @staticmethod
+    def eth_to_io(eth_address: str) -> Optional[str]:
+        """Convert 0x address to io format"""
+        if not eth_address.startswith('0x'):
+            return None
         
         try:
-            response = requests.post(self.api_url, json={'query': query, 'variables': variables}, timeout=10)
-            data = response.json()
-            
-            if 'errors' in data:
-                logger.error(f"GraphQL errors: {data['errors']}")
-                return []
-            
-            transactions = data.get('data', {}).get('transactionsByAddress', {}).get('transactions', [])
-            return self._normalize_transactions(transactions, address)
-        except Exception as e:
-            logger.error(f"Error getting transactions: {e}")
-            return []
+            import bech32
+            addr_bytes = bytes.fromhex(eth_address[2:])
+            if len(addr_bytes) != 20:
+                return None
+            data = bech32.convertbits(addr_bytes, 8, 5)
+            if data is None:
+                return None
+            return bech32.bech32_encode('io', data)
+        except:
+            return None
     
-    def _normalize_transactions(self, transactions, user_address):
-        """Normalize transaction data"""
-        normalized = []
-        
-        for tx in transactions:
-            # Convert value from wei to IOTX (18 decimals)
-            value_wei = int(tx.get('value', '0'))
-            value_iotx = value_wei / 10**18
-            
-            # Determine direction
-            direction = "IN" if tx.get('to', '').lower() == user_address.lower() else "OUT"
-            
-            # Convert timestamp
-            timestamp_seconds = tx.get('block', {}).get('timestamp', {}).get('seconds', 0)
-            if timestamp_seconds:
-                timestamp = datetime.fromtimestamp(timestamp_seconds).isoformat()
-            else:
-                timestamp = datetime.now().isoformat()
-            
-            normalized_tx = {
-                'hash': tx.get('hash'),
-                'from': tx.get('from'),
-                'to': tx.get('to'),
-                'amount': value_iotx,
-                'token': 'IOTX',
-                'direction': direction,
-                'block_number': tx.get('block', {}).get('height'),
-                'timestamp': timestamp
-            }
-            normalized.append(normalized_tx)
-        
-        return normalized
+    @staticmethod
+    def validate_address(address: str) -> bool:
+        """Validate IoTeX address format"""
+        if address.startswith('io'):
+            return len(address) == 41 or len(address) == 42
+        elif address.startswith('0x'):
+            return len(address) == 42 and all(c in '0123456789abcdefABCDEF' for c in address[2:])
+        return False
+    
+    @staticmethod
+    def normalize_address(address: str) -> tuple:
+        """Returns (io_address, eth_address)"""
+        if address.startswith('io'):
+            eth = AddressConverter.io_to_eth(address)
+            return (address.lower(), eth.lower() if eth else None)
+        elif address.startswith('0x'):
+            io = AddressConverter.eth_to_io(address)
+            return (io.lower() if io else None, address.lower())
+        return (None, None)
 
-class IoTeXMonitor:
-    def __init__(self):
-        self.storage = Storage()
-        self.iotex_api = IoTeXAPI()
-        self.alert_cooldown = 30
+class IoTeXAPI:
+    def __init__(self, rpc_url: str, graphql_url: str):
+        self.rpc_url = rpc_url
+        self.graphql_url = graphql_url
     
-    def check_all_users(self):
+    def get_current_block(self) -> Optional[int]:
+        """Get current block height"""
         try:
-            users = self.storage.get_all_active_users()
-            if not users:
-                return
-            
-            # Get current block height
-            current_block = self.iotex_api.get_latest_block()
-            if not current_block:
-                logger.error("Could not get current block height")
-                return
-            
-            if int(time.time()) % 60 < 4:
-                total_alerts = sum(user.get('total_alerts', 0) for user in users)
-                logger.info(f"👁️ Monitoring {len(users)} users | Block: {current_block} | Alerts: {total_alerts}")
-            
-            for user in users:
-                self.check_user_transactions(user, current_block)
-                
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_blockNumber",
+                "params": [],
+                "id": 1
+            }
+            response = requests.post(self.rpc_url, json=payload, timeout=10)
+            if response.status_code == 200:
+                result = response.json().get('result')
+                return int(result, 16) if result else None
         except Exception as e:
-            logger.error(f"Monitor error: {e}")
+            logger.error(f"Error getting current block: {e}")
+        return None
     
-    def check_user_transactions(self, user, current_block):
+    def get_transactions(self, address: str, start_block: int, end_block: int) -> List[Dict]:
+        """Get transactions for an address using GraphQL"""
+        transactions = []
+        
         try:
-            if not user.get('address'):
-                return
+            query = """
+            query {
+              account(address: "%s") {
+                address
+                transactions(first: 50) {
+                  hash
+                  from
+                  to
+                  amount
+                  gasPrice
+                  gasUsed
+                  timestamp
+                  blockNumber
+                  status
+                }
+              }
+            }
+            """ % address
             
-            user_address = user['address']
-            last_checked_block = user.get('last_checked_block', 0)
+            response = requests.post(
+                self.graphql_url,
+                json={'query': query},
+                timeout=15
+            )
             
-            # Start from last checked block + 1, or current block - 1000 for new users
-            from_block = last_checked_block + 1 if last_checked_block > 0 else max(1, current_block - 1000)
-            to_block = current_block
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and data['data'].get('account'):
+                    txs = data['data']['account'].get('transactions', [])
+                    for tx in txs:
+                        if tx.get('blockNumber'):
+                            block_num = int(tx['blockNumber'])
+                            if start_block <= block_num <= end_block:
+                                transactions.append(tx)
+        except Exception as e:
+            logger.error(f"Error fetching transactions: {e}")
+        
+        return transactions
+    
+    def get_staking_info(self, address: str) -> Optional[Dict]:
+        """Get staking information for address"""
+        try:
+            query = """
+            query {
+              account(address: "%s") {
+                address
+                stakingBuckets {
+                  amount
+                  stakedDuration
+                  delegate {
+                    name
+                    address
+                  }
+                  unstakeStartEpoch
+                }
+              }
+            }
+            """ % address
             
-            if from_block > to_block:
-                return  # No new blocks to check
+            response = requests.post(
+                self.graphql_url,
+                json={'query': query},
+                timeout=15
+            )
             
-            logger.info(f"Checking blocks {from_block}-{to_block} for {AddressUtils.shorten_address(user_address)}")
+            if response.status_code == 200:
+                data = response.json()
+                if 'data' in data and data['data'].get('account'):
+                    return data['data']['account']
+        except Exception as e:
+            logger.error(f"Error fetching staking info: {e}")
+        
+        return None
+
+class TelegramBot:
+    def __init__(self, db: Database, iotex_api: IoTeXAPI):
+        self.db = db
+        self.iotex_api = iotex_api
+        self.offset = 0
+    
+    def send_message(self, chat_id: int, text: str, parse_mode: str = 'HTML'):
+        """Send message to user"""
+        try:
+            payload = {
+                'chat_id': chat_id,
+                'text': text,
+                'parse_mode': parse_mode,
+                'disable_web_page_preview': True
+            }
+            response = requests.post(f"{TELEGRAM_API}/sendMessage", json=payload)
+            return response.status_code == 200
+        except Exception as e:
+            logger.error(f"Error sending message: {e}")
+            return False
+    
+    def get_updates(self) -> List[Dict]:
+        """Get updates from Telegram"""
+        try:
+            response = requests.get(
+                f"{TELEGRAM_API}/getUpdates",
+                params={'offset': self.offset, 'timeout': 30}
+            )
+            if response.status_code == 200:
+                return response.json().get('result', [])
+        except Exception as e:
+            logger.error(f"Error getting updates: {e}")
+        return []
+    
+    def handle_start(self, chat_id: int):
+        """Handle /start command"""
+        text = """
+👋 <b>Welcome to IoTeX Alert Bot!</b>
+
+I'll notify you instantly when:
+• 🎉 You receive staking rewards
+• 📥 You receive IOTX transactions
+• 📤 You send IOTX transactions
+
+<b>Getting Started:</b>
+Use /setaddress followed by your IoTeX address
+
+<b>Example:</b>
+<code>/setaddress io1abc123...</code>
+or
+<code>/setaddress 0xabc123...</code>
+
+<b>Available Commands:</b>
+/setaddress - Set your IoTeX address
+/getaddress - View your saved address
+/settings - Customize alert preferences
+/unsubscribe - Stop all alerts
+/help - Show this message
+
+Let's get started! 🚀
+"""
+        self.send_message(chat_id, text)
+    
+    def handle_setaddress(self, chat_id: int, address: str):
+        """Handle /setaddress command"""
+        if not address:
+            self.send_message(
+                chat_id,
+                "❌ Please provide an address.\n\n"
+                "Usage: <code>/setaddress io1abc123...</code>"
+            )
+            return
+        
+        if not AddressConverter.validate_address(address):
+            self.send_message(
+                chat_id,
+                "❌ Invalid address format.\n\n"
+                "Please provide a valid IoTeX address:\n"
+                "• Native format: <code>io1...</code> (41-42 characters)\n"
+                "• EVM format: <code>0x...</code> (42 characters)"
+            )
+            return
+        
+        io_addr, eth_addr = AddressConverter.normalize_address(address)
+        
+        if not io_addr and not eth_addr:
+            self.send_message(chat_id, "❌ Failed to process address. Please try again.")
+            return
+        
+        self.db.save_user(chat_id, io_addr, eth_addr)
+        
+        # Initialize last block to current
+        current_block = self.iotex_api.get_current_block()
+        if current_block:
+            self.db.update_last_block(chat_id, current_block)
+        
+        display_addr = io_addr if io_addr else eth_addr
+        text = f"""
+✅ <b>Address saved successfully!</b>
+
+📍 <b>Your address:</b>
+<code>{display_addr}</code>
+
+I'll now monitor this address and send you alerts for:
+• Staking rewards 🎉
+• Incoming transactions 📥
+• Outgoing transactions 📤
+
+Use /settings to customize which alerts you receive.
+"""
+        self.send_message(chat_id, text)
+        logger.info(f"User {chat_id} set address: {display_addr}")
+    
+    def handle_getaddress(self, chat_id: int):
+        """Handle /getaddress command"""
+        user = self.db.get_user(chat_id)
+        
+        if not user or not user.get('io_address'):
+            self.send_message(
+                chat_id,
+                "❌ No address saved.\n\n"
+                "Use /setaddress to set your IoTeX address."
+            )
+            return
+        
+        io_addr = user['io_address']
+        eth_addr = user['eth_address']
+        
+        text = f"""
+📍 <b>Your saved address:</b>
+
+<b>Native format:</b>
+<code>{io_addr if io_addr else 'N/A'}</code>
+
+<b>EVM format:</b>
+<code>{eth_addr if eth_addr else 'N/A'}</code>
+
+<b>Alert Settings:</b>
+• Staking Rewards: {'✅ ON' if user['alert_rewards'] else '❌ OFF'}
+• Incoming TX: {'✅ ON' if user['alert_tx_in'] else '❌ OFF'}
+• Outgoing TX: {'✅ ON' if user['alert_tx_out'] else '❌ OFF'}
+
+Use /settings to change your preferences.
+"""
+        self.send_message(chat_id, text)
+    
+    def handle_settings(self, chat_id: int, args: str = ''):
+        """Handle /settings command"""
+        user = self.db.get_user(chat_id)
+        
+        if not user or not user.get('io_address'):
+            self.send_message(
+                chat_id,
+                "❌ Please set your address first using /setaddress"
+            )
+            return
+        
+        if not args:
+            text = f"""
+⚙️ <b>Alert Settings</b>
+
+Current settings:
+• Staking Rewards: {'✅ ON' if user['alert_rewards'] else '❌ OFF'}
+• Incoming TX: {'✅ ON' if user['alert_tx_in'] else '❌ OFF'}
+• Outgoing TX: {'✅ ON' if user['alert_tx_out'] else '❌ OFF'}
+
+<b>Change settings:</b>
+<code>/settings all</code> - Enable all alerts
+<code>/settings rewards</code> - Toggle rewards only
+<code>/settings tx_in</code> - Toggle incoming TX
+<code>/settings tx_out</code> - Toggle outgoing TX
+<code>/settings none</code> - Disable all alerts
+"""
+            self.send_message(chat_id, text)
+            return
+        
+        # Handle setting changes
+        args = args.lower().strip()
+        
+        if args == 'all':
+            self.db.update_settings(chat_id, 1, 1, 1)
+            self.send_message(chat_id, "✅ All alerts enabled!")
+        elif args == 'none':
+            self.db.update_settings(chat_id, 0, 0, 0)
+            self.send_message(chat_id, "✅ All alerts disabled!")
+        elif args == 'rewards':
+            new_val = 0 if user['alert_rewards'] else 1
+            self.db.update_settings(chat_id, new_val, user['alert_tx_in'], user['alert_tx_out'])
+            self.send_message(chat_id, f"✅ Reward alerts {'enabled' if new_val else 'disabled'}!")
+        elif args == 'tx_in':
+            new_val = 0 if user['alert_tx_in'] else 1
+            self.db.update_settings(chat_id, user['alert_rewards'], new_val, user['alert_tx_out'])
+            self.send_message(chat_id, f"✅ Incoming TX alerts {'enabled' if new_val else 'disabled'}!")
+        elif args == 'tx_out':
+            new_val = 0 if user['alert_tx_out'] else 1
+            self.db.update_settings(chat_id, user['alert_rewards'], user['alert_tx_in'], new_val)
+            self.send_message(chat_id, f"✅ Outgoing TX alerts {'enabled' if new_val else 'disabled'}!")
+        else:
+            self.send_message(chat_id, "❌ Invalid option. Use /settings to see available options.")
+    
+    def handle_unsubscribe(self, chat_id: int):
+        """Handle /unsubscribe command"""
+        user = self.db.get_user(chat_id)
+        
+        if not user:
+            self.send_message(chat_id, "You're not subscribed to any alerts.")
+            return
+        
+        self.db.delete_user(chat_id)
+        text = """
+✅ <b>Successfully unsubscribed</b>
+
+Your data has been deleted from our system.
+
+You can always come back and use /start to set up alerts again.
+
+Thank you for using IoTeX Alert Bot! 👋
+"""
+        self.send_message(chat_id, text)
+        logger.info(f"User {chat_id} unsubscribed")
+    
+    def handle_help(self, chat_id: int):
+        """Handle /help command"""
+        text = """
+📚 <b>IoTeX Alert Bot - Help</b>
+
+<b>Features:</b>
+• Real-time staking reward notifications
+• Instant transaction alerts (send/receive)
+• Support for both io... and 0x... addresses
+• Customizable alert preferences
+
+<b>Commands:</b>
+/start - Start the bot and get instructions
+/setaddress - Set/update your IoTeX address
+/getaddress - View your saved address
+/settings - Customize alert preferences
+/unsubscribe - Stop all alerts and delete data
+/help - Show this help message
+
+<b>Examples:</b>
+<code>/setaddress io1abc123...</code>
+<code>/settings all</code>
+<code>/settings rewards</code>
+
+<b>Privacy:</b>
+We only store your chat ID and address. We never ask for private keys or seed phrases.
+
+<b>Support:</b>
+For issues or questions, please contact the bot administrator.
+
+⚡ Powered by IoTeX
+"""
+        self.send_message(chat_id, text)
+    
+    def process_updates(self):
+        """Process incoming Telegram updates"""
+        updates = self.get_updates()
+        
+        for update in updates:
+            self.offset = update['update_id'] + 1
             
-            # Get real transactions from IoTeX blockchain
-            transactions = self.iotex_api.get_transactions_for_address(user_address, from_block, to_block)
+            if 'message' not in update:
+                continue
             
-            if transactions:
-                logger.info(f"Found {len(transactions)} transactions for {AddressUtils.shorten_address(user_address)}")
+            message = update['message']
+            chat_id = message['chat']['id']
+            text = message.get('text', '')
+            
+            if not text.startswith('/'):
+                continue
+            
+            parts = text.split(maxsplit=1)
+            command = parts[0].lower().replace(f'@{BOT_TOKEN.split(":")[0]}', '')
+            args = parts[1] if len(parts) > 1 else ''
+            
+            try:
+                if command == '/start':
+                    self.handle_start(chat_id)
+                elif command == '/setaddress':
+                    self.handle_setaddress(chat_id, args)
+                elif command == '/getaddress':
+                    self.handle_getaddress(chat_id)
+                elif command == '/settings':
+                    self.handle_settings(chat_id, args)
+                elif command == '/unsubscribe':
+                    self.handle_unsubscribe(chat_id)
+                elif command == '/help':
+                    self.handle_help(chat_id)
+                else:
+                    self.send_message(chat_id, "Unknown command. Use /help to see available commands.")
+            except Exception as e:
+                logger.error(f"Error processing command {command}: {e}")
+                self.send_message(chat_id, "An error occurred. Please try again later.")
+    
+    def format_timestamp(self, timestamp: int) -> str:
+        """Format timestamp to local timezone"""
+        dt = datetime.fromtimestamp(timestamp, tz=TIMEZONE)
+        return dt.strftime('%Y-%m-%d %H:%M:%S %Z')
+    
+    def shorten_address(self, address: str) -> str:
+        """Shorten address for display"""
+        if len(address) > 15:
+            return f"{address[:6]}...{address[-4:]}"
+        return address
+    
+    def send_transaction_alert(self, chat_id: int, tx: Dict, user_address: str, is_incoming: bool):
+        """Send transaction alert"""
+        amount_iotx = float(tx.get('amount', 0)) / 1e18
+        tx_hash = tx.get('hash', 'unknown')
+        from_addr = tx.get('from', '').lower()
+        to_addr = tx.get('to', '').lower()
+        timestamp = int(tx.get('timestamp', 0))
+        block_num = tx.get('blockNumber', 'unknown')
+        
+        explorer_url = f"https://iotexscan.io/tx/{tx_hash}"
+        
+        if is_incoming:
+            emoji = "📥"
+            direction = "Incoming Transaction"
+            other_addr = from_addr
+            label = "From"
+        else:
+            emoji = "📤"
+            direction = "Outgoing Transaction"
+            other_addr = to_addr
+            label = "To"
+        
+        text = f"""
+{emoji} <b>{direction}</b>
+
+👤 <b>{label}:</b> <code>{self.shorten_address(other_addr)}</code>
+💰 <b>Amount:</b> {amount_iotx:.4f} IOTX
+🔗 <b>Transaction:</b> <a href="{explorer_url}">View on Explorer</a>
+📦 <b>Block:</b> {block_num}
+🕐 <b>Time:</b> {self.format_timestamp(timestamp)}
+"""
+        
+        self.send_message(chat_id, text)
+        logger.info(f"Sent {'incoming' if is_incoming else 'outgoing'} TX alert to {chat_id}")
+    
+    def send_reward_alert(self, chat_id: int, reward_info: Dict):
+        """Send staking reward alert"""
+        amount = reward_info.get('amount', 0)
+        validator_name = reward_info.get('validator_name', 'Unknown')
+        tx_hash = reward_info.get('tx_hash', 'unknown')
+        
+        explorer_url = f"https://iotexscan.io/tx/{tx_hash}"
+        
+        text = f"""
+🎉 <b>Staking Reward Received!</b>
+
+💰 <b>Amount:</b> {amount} IOTX
+🏛 <b>Validator:</b> {validator_name}
+🔍 <a href="{explorer_url}">View on Explorer</a>
+"""
+        
+        self.send_message(chat_id, text)
+        logger.info(f"Sent reward alert to {chat_id}")
+    
+    def monitor_transactions(self):
+        """Monitor transactions for all users"""
+        users = self.db.get_all_users()
+        current_block = self.iotex_api.get_current_block()
+        
+        if not current_block:
+            return
+        
+        for user in users:
+            chat_id = user['chat_id']
+            address = user['eth_address'] or user['io_address']
+            
+            if not address:
+                continue
+            
+            last_block = self.db.get_last_block(chat_id)
+            if not last_block:
+                last_block = current_block - 100  # Start from 100 blocks ago
+            
+            # Only check confirmed blocks
+            end_block = current_block - CONFIRMATIONS
+            
+            if last_block >= end_block:
+                continue
+            
+            try:
+                transactions = self.iotex_api.get_transactions(address, last_block + 1, end_block)
                 
                 for tx in transactions:
-                    if tx['direction'] == 'IN' and user['preferences'].get('tx_in', True):
-                        self.send_transaction_alert(user, tx, 'incoming')
-                    elif tx['direction'] == 'OUT' and user['preferences'].get('tx_out', True):
-                        self.send_transaction_alert(user, tx, 'outgoing')
-            
-            # Update last checked block
-            self.storage.update_last_checked_block(user['chat_id'], to_block)
+                    tx_hash = tx.get('hash')
                     
-        except Exception as e:
-            logger.error(f"Transaction check error: {e}")
-    
-    def send_transaction_alert(self, user, tx, direction):
-        try:
-            amount = tx['amount']
-            explorer_link = f"https://iotexscan.io/tx/{tx['hash']}"
-            
-            if direction == 'incoming':
-                short_sender = AddressUtils.shorten_address(tx['from'])
+                    if not tx_hash or self.db.is_tx_processed(chat_id, tx_hash):
+                        continue
+                    
+                    from_addr = tx.get('from', '').lower()
+                    to_addr = tx.get('to', '').lower()
+                    user_addr = address.lower()
+                    
+                    is_incoming = to_addr == user_addr and from_addr != user_addr
+                    is_outgoing = from_addr == user_addr and to_addr != user_addr
+                    
+                    if is_incoming and user['alert_tx_in']:
+                        self.send_transaction_alert(chat_id, tx, user_addr, True)
+                        self.db.mark_tx_processed(chat_id, tx_hash)
+                    elif is_outgoing and user['alert_tx_out']:
+                        self.send_transaction_alert(chat_id, tx, user_addr, False)
+                        self.db.mark_tx_processed(chat_id, tx_hash)
                 
-                message = f"""📥 Incoming Transaction:
-
-👤 From: {short_sender}
-💰 Amount: {amount:.4f} IOTX
-🔗 Transaction: [View on Explorer]({explorer_link})"""
-            else:
-                short_receiver = AddressUtils.shorten_address(tx['to'])
+                self.db.update_last_block(chat_id, end_block)
                 
-                message = f"""📤 Outgoing Transaction:
+            except Exception as e:
+                logger.error(f"Error monitoring transactions for {chat_id}: {e}")
 
-👤 To: {short_receiver}
-💰 Amount: {amount:.4f} IOTX
-🔗 Transaction: [View on Explorer]({explorer_link})"""
-            
-            if send_telegram_message(user['chat_id'], message):
-                self.storage.update_last_alert(user['chat_id'])
-                logger.info(f"📨 Sent REAL {direction} transaction alert to {user['chat_id']}")
-                
-        except Exception as e:
-            logger.error(f"Alert error: {e}")
-
-def send_telegram_message(chat_id: int, text: str, parse_mode: str = "Markdown") -> bool:
-    url = f"{TELEGRAM_API_BASE}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": parse_mode
-    }
+def run_bot():
+    """Main bot loop"""
+    db = Database(DB_PATH)
+    iotex_api = IoTeXAPI(IOTEX_RPC_URL, IOTEX_GRAPHQL_URL)
+    bot = TelegramBot(db, iotex_api)
     
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        return response.status_code == 200
-    except Exception as e:
-        logger.error(f"Send error: {e}")
-        return False
-
-def process_telegram_message(chat_id: int, text: str) -> None:
-    storage = Storage()
-    text = text.strip()
-    logger.info(f"Processing: '{text}' from {chat_id}")
+    logger.info("Bot started successfully!")
+    logger.info(f"Polling interval: {POLL_INTERVAL_SEC}s")
+    logger.info(f"Confirmations required: {CONFIRMATIONS}")
     
-    if text.lower() in ['/start', '/start@dustpin_bot']:
-        welcome = """🤖 *IoTeX Alert System - REAL Monitoring*
-
-Now monitoring REAL IoTeX blockchain transactions!
-
-📥 Incoming Transactions
-📤 Outgoing Transactions  
-
-*Quick Start:*
-Send your IoTeX address to begin REAL monitoring!"""
-        send_telegram_message(chat_id, welcome)
-    
-    elif text.lower().startswith('/setaddress'):
-        parts = text.split()
-        if len(parts) < 2:
-            send_telegram_message(chat_id, "📍 Usage: `/setaddress YOUR_ADDRESS`")
-            return
-        
-        address = parts[1]
-        is_valid, normalized_address = AddressUtils.validate_address(address)
-        
-        if not is_valid:
-            send_telegram_message(chat_id, "❌ Invalid format. Use: `io1...` or `0x...`")
-            return
-        
-        if storage.is_address_in_watchlist(normalized_address):
-            short_addr = AddressUtils.shorten_address(normalized_address)
-            send_telegram_message(chat_id, f"⚠️ Already watching:\n`{short_addr}`")
-            return
-        
-        storage.save_user(chat_id, normalized_address)
-        short_addr = AddressUtils.shorten_address(normalized_address)
-        
-        response = f"""✅ *Address Added to Watchlist*
-
-`{short_addr}`
-
-🎯 *REAL IoTeX Monitoring Activated*
-
-I'm now scanning the actual IoTeX blockchain for your transactions.
-
-You will receive alerts for:
-• 📥 Incoming transactions (REAL)
-• 📤 Outgoing transactions (REAL)
-
-Monitoring starts from the current block!"""
-        send_telegram_message(chat_id, response)
-    
-    elif text.lower() in ['/watchlist', '/watchlist@dustpin_bot']:
-        user = storage.get_user(chat_id)
-        if not user:
-            send_telegram_message(chat_id, "📋 No addresses. Send an address!")
-            return
-        
-        short_addr = AddressUtils.shorten_address(user['address'])
-        last_alert = user.get('last_alert_sent', 'Never')
-        total_alerts = user.get('total_alerts', 0)
-        last_block = user.get('last_checked_block', 0)
-        
-        response = f"""📋 *Watchlist Status*
-
-👁️ Monitored: `{short_addr}`
-📊 Alerts: {total_alerts}
-🕒 Last: {last_alert}
-📦 Last Block: {last_block}
-🟢 Status: REAL Monitoring"""
-        send_telegram_message(chat_id, response)
-    
-    elif text.lower() in ['/testalert', '/testalert@dustpin_bot']:
-        test_message = """🧪 *Test Complete - REAL Monitoring Active*
-
-Your bot is now monitoring the REAL IoTeX blockchain!
-
-Add an address to start receiving REAL transaction alerts.
-
-Try: `/setaddress 0x87bf036bf1ec2673ef02bb47d6112b9d5ea30d1d`"""
-        send_telegram_message(chat_id, test_message)
-    
-    elif text.lower() in ['/status', '/status@dustpin_bot']:
-        users = storage.get_all_active_users()
-        total_alerts = sum(user.get('total_alerts', 0) for user in users)
-        
-        # Get current block
-        iotex_api = IoTeXAPI()
-        current_block = iotex_api.get_latest_block() or "Unknown"
-        
-        status_message = f"""📊 *System Status*
-
-🟢 Bot: Online (REAL Monitoring)
-⏱️ Interval: 4 seconds
-👥 Users: {len(users)}
-🔔 Alerts: {total_alerts}
-📦 Current Block: {current_block}
-🌐 Host: Railway"""
-        send_telegram_message(chat_id, status_message)
-    
-    elif text.lower() in ['/help', '/help@dustpin_bot']:
-        help_text = """🆘 *Commands*
-
-/start - Welcome message
-/setaddress <addr> - Add address for REAL monitoring
-/watchlist - View status
-/status - System status
-/help - This message
-
-🎯 *Now monitoring REAL IoTeX blockchain transactions!*"""
-        send_telegram_message(chat_id, help_text)
-    
-    else:
-        is_valid, normalized_address = AddressUtils.validate_address(text)
-        if is_valid:
-            if storage.is_address_in_watchlist(normalized_address):
-                short_addr = AddressUtils.shorten_address(normalized_address)
-                send_telegram_message(chat_id, f"⚠️ Already watching:\n`{short_addr}`")
-                return
-            
-            storage.save_user(chat_id, normalized_address)
-            short_addr = AddressUtils.shorten_address(normalized_address)
-            
-            response = f"""✅ *Address Added to Watchlist*
-
-`{short_addr}`
-
-🎯 *REAL IoTeX Monitoring Activated*
-
-I'm now scanning the actual IoTeX blockchain for your transactions.
-
-You will receive alerts for REAL:
-• 📥 Incoming transactions
-• 📤 Outgoing transactions
-
-Monitoring starts from the current block!"""
-            send_telegram_message(chat_id, response)
-        else:
-            send_telegram_message(chat_id, "❌ Unknown command. Use /help")
-
-def poll_telegram_updates():
-    offset = None
-    
-    logger.info("🤖 Starting IoTeX Bot (REAL Monitoring)...")
+    last_monitor = 0
     
     while True:
         try:
-            url = f"{TELEGRAM_API_BASE}/getUpdates"
-            params = {'timeout': 30}
-            if offset:
-                params['offset'] = offset
-                
-            response = requests.get(url, params=params, timeout=35)
-            data = response.json()
+            # Process Telegram updates
+            bot.process_updates()
             
-            if data.get('ok'):
-                for update in data['result']:
-                    offset = update['update_id'] + 1
-                    
-                    if 'message' in update:
-                        message = update['message']
-                        chat_id = message['chat']['id']
-                        text = message.get('text', '').strip()
-                        
-                        if text:
-                            logger.info(f"📨 From {chat_id}: {text}")
-                            process_telegram_message(chat_id, text)
+            # Monitor transactions periodically
+            current_time = time.time()
+            if current_time - last_monitor >= POLL_INTERVAL_SEC:
+                bot.monitor_transactions()
+                last_monitor = current_time
             
             time.sleep(1)
             
+        except KeyboardInterrupt:
+            logger.info("Bot stopped by user")
+            break
         except Exception as e:
-            logger.error(f"Polling error: {e}")
+            logger.error(f"Unexpected error: {e}")
             time.sleep(5)
 
-def start_monitoring():
-    monitor = IoTeXMonitor()
-    logger.info("🚀 Starting REAL IoTeX blockchain monitoring (4s intervals)...")
-    while True:
-        try:
-            monitor.check_all_users()
-            time.sleep(4)
-        except Exception as e:
-            logger.error(f"Monitoring error: {e}")
-            time.sleep(2)
-
-app = Flask(__name__)
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    update = request.get_json()
-    logger.info("Received webhook update")
-    
-    try:
-        if "message" in update:
-            message = update["message"]
-            chat_id = message["chat"]["id"]
-            text = message.get("text", "").strip()
-            
-            if text:
-                logger.info(f"📨 From {chat_id}: {text}")
-                process_telegram_message(chat_id, text)
-        
-        return jsonify({"status": "ok"})
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({"status": "error"}), 500
-
-@app.route('/set_webhook', methods=['GET'])
-def set_webhook():
-    webhook_url = f"https://{request.host}/webhook"
-    url = f"{TELEGRAM_API_BASE}/setWebhook"
-    payload = {"url": webhook_url}
-    
-    try:
-        response = requests.post(url, json=payload)
-        if response.json().get('ok'):
-            return jsonify({
-                "status": "success", 
-                "webhook_url": webhook_url,
-                "message": "✅ Webhook set successfully! Your bot is now live on Railway!"
-            })
-        else:
-            return jsonify({"status": "error", "message": response.json()}), 500
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-@app.route('/')
-def home():
-    return jsonify({"status": "running", "service": "iotex-alert-bot", "monitoring": "REAL"})
-
-@app.route('/healthz')
-def health_check():
-    return jsonify({"status": "healthy"})
-
 if __name__ == '__main__':
-    monitor_thread = Thread(target=start_monitoring, daemon=True)
-    monitor_thread.start()
-    
-    port = int(os.getenv('PORT', 8080))
-    logger.info(f"🌐 Starting IoTeX Bot on port {port}")
-    app.run(host='0.0.0.0', port=port, debug=False)
+    run_bot()
