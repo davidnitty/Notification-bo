@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk')
 IOTEX_RPC_URL = os.getenv('IOTEX_RPC_URL', 'https://babel-api.mainnet.iotex.io')
-IOTEX_GRAPHQL_URL = os.getenv('IOTEX_GRAPHQL_URL', 'https://analyser-api.iotex.io/graphql')
+IOTEXSCAN_API = os.getenv('IOTEXSCAN_API', 'https://iotexscout.io/api')
 CONFIRMATIONS = int(os.getenv('CONFIRMATIONS', '3'))
 POLL_INTERVAL_SEC = int(os.getenv('POLL_INTERVAL_SEC', '20'))
 TIMEZONE = pytz.timezone(os.getenv('TZ', 'Africa/Lagos'))
@@ -230,12 +230,16 @@ class AddressConverter:
         return (None, None)
 
 class IoTeXAPI:
-    def __init__(self, rpc_url: str, graphql_url: str):
+    def __init__(self, rpc_url: str):
         self.rpc_url = rpc_url
-        self.graphql_url = graphql_url
+        self.session = requests.Session()
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        })
     
     def get_current_block(self) -> Optional[int]:
-        """Get current block height"""
+        """Get current block height using eth_blockNumber"""
         try:
             payload = {
                 "jsonrpc": "2.0",
@@ -243,92 +247,124 @@ class IoTeXAPI:
                 "params": [],
                 "id": 1
             }
-            response = requests.post(self.rpc_url, json=payload, timeout=10)
+            response = self.session.post(self.rpc_url, json=payload, timeout=15)
             if response.status_code == 200:
                 result = response.json().get('result')
-                return int(result, 16) if result else None
+                if result:
+                    return int(result, 16)
         except Exception as e:
             logger.error(f"Error getting current block: {e}")
         return None
     
-    def get_transactions(self, address: str, start_block: int, end_block: int) -> List[Dict]:
-        """Get transactions for an address using GraphQL"""
+    def get_transaction_count(self, address: str, block: str = 'latest') -> Optional[int]:
+        """Get transaction count for address"""
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_getTransactionCount",
+                "params": [address, block],
+                "id": 1
+            }
+            response = self.session.post(self.rpc_url, json=payload, timeout=15)
+            if response.status_code == 200:
+                result = response.json().get('result')
+                if result:
+                    return int(result, 16)
+        except Exception as e:
+            logger.error(f"Error getting transaction count: {e}")
+        return None
+    
+    def get_block_by_number(self, block_num: int, full_tx: bool = True) -> Optional[Dict]:
+        """Get block by number"""
+        try:
+            block_hex = hex(block_num)
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_getBlockByNumber",
+                "params": [block_hex, full_tx],
+                "id": 1
+            }
+            response = self.session.post(self.rpc_url, json=payload, timeout=15)
+            if response.status_code == 200:
+                return response.json().get('result')
+        except Exception as e:
+            logger.error(f"Error getting block {block_num}: {e}")
+        return None
+    
+    def get_balance(self, address: str, block: str = 'latest') -> Optional[int]:
+        """Get balance for address in RAU (1 IOTX = 10^18 RAU)"""
+        try:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "eth_getBalance",
+                "params": [address, block],
+                "id": 1
+            }
+            response = self.session.post(self.rpc_url, json=payload, timeout=15)
+            if response.status_code == 200:
+                result = response.json().get('result')
+                if result:
+                    return int(result, 16)
+        except Exception as e:
+            logger.error(f"Error getting balance: {e}")
+        return None
+    
+    def get_transactions_from_blocks(self, address: str, start_block: int, end_block: int) -> List[Dict]:
+        """Get transactions for an address by scanning blocks"""
         transactions = []
+        address = address.lower()
         
         try:
-            query = """
-            query {
-              account(address: "%s") {
-                address
-                transactions(first: 50) {
-                  hash
-                  from
-                  to
-                  amount
-                  gasPrice
-                  gasUsed
-                  timestamp
-                  blockNumber
-                  status
-                }
-              }
-            }
-            """ % address
-            
-            response = requests.post(
-                self.graphql_url,
-                json={'query': query},
-                timeout=15
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'data' in data and data['data'].get('account'):
-                    txs = data['data']['account'].get('transactions', [])
-                    for tx in txs:
-                        if tx.get('blockNumber'):
-                            block_num = int(tx['blockNumber'])
-                            if start_block <= block_num <= end_block:
-                                transactions.append(tx)
+            # Scan blocks in batches
+            for block_num in range(start_block, end_block + 1):
+                try:
+                    block = self.get_block_by_number(block_num, True)
+                    if not block or not block.get('transactions'):
+                        continue
+                    
+                    # Check each transaction in the block
+                    for tx in block['transactions']:
+                        if not isinstance(tx, dict):
+                            continue
+                        
+                        tx_from = tx.get('from', '').lower()
+                        tx_to = tx.get('to', '').lower()
+                        
+                        # Check if transaction involves our address
+                        if tx_from == address or tx_to == address:
+                            # Convert hex values to decimal
+                            value_hex = tx.get('value', '0x0')
+                            value = int(value_hex, 16) if value_hex else 0
+                            
+                            gas_price_hex = tx.get('gasPrice', '0x0')
+                            gas_price = int(gas_price_hex, 16) if gas_price_hex else 0
+                            
+                            gas_hex = tx.get('gas', '0x0')
+                            gas_used = int(gas_hex, 16) if gas_hex else 0
+                            
+                            timestamp = int(block.get('timestamp', '0x0'), 16)
+                            
+                            transactions.append({
+                                'hash': tx.get('hash'),
+                                'from': tx_from,
+                                'to': tx_to,
+                                'value': value,
+                                'gasPrice': gas_price,
+                                'gasUsed': gas_used,
+                                'timestamp': timestamp,
+                                'blockNumber': block_num,
+                                'blockHash': tx.get('blockHash'),
+                                'status': 1  # Assume success if in block
+                            })
+                
+                except Exception as e:
+                    logger.error(f"Error processing block {block_num}: {e}")
+                    continue
+                    
         except Exception as e:
-            logger.error(f"Error fetching transactions: {e}")
+            logger.error(f"Error scanning blocks {start_block}-{end_block}: {e}")
         
         return transactions
-    
-    def get_staking_info(self, address: str) -> Optional[Dict]:
-        """Get staking information for address"""
-        try:
-            query = """
-            query {
-              account(address: "%s") {
-                address
-                stakingBuckets {
-                  amount
-                  stakedDuration
-                  delegate {
-                    name
-                    address
-                  }
-                  unstakeStartEpoch
-                }
-              }
-            }
-            """ % address
-            
-            response = requests.post(
-                self.graphql_url,
-                json={'query': query},
-                timeout=15
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'data' in data and data['data'].get('account'):
-                    return data['data']['account']
-        except Exception as e:
-            logger.error(f"Error fetching staking info: {e}")
-        
-        return None
 
 class TelegramBot:
     def __init__(self, db: Database, iotex_api: IoTeXAPI):
@@ -638,7 +674,8 @@ For issues or questions, please contact the bot administrator.
     
     def send_transaction_alert(self, chat_id: int, tx: Dict, user_address: str, is_incoming: bool):
         """Send transaction alert"""
-        amount_iotx = float(tx.get('amount', 0)) / 1e18
+        value = tx.get('value', 0)
+        amount_iotx = float(value) / 1e18
         tx_hash = tx.get('hash', 'unknown')
         from_addr = tx.get('from', '').lower()
         to_addr = tx.get('to', '').lower()
@@ -696,6 +733,7 @@ For issues or questions, please contact the bot administrator.
         current_block = self.iotex_api.get_current_block()
         
         if not current_block:
+            logger.warning("Could not get current block, skipping this cycle")
             return
         
         for user in users:
@@ -705,9 +743,20 @@ For issues or questions, please contact the bot administrator.
             if not address:
                 continue
             
+            # Ensure address is in 0x format for RPC calls
+            if address.startswith('io'):
+                address = AddressConverter.io_to_eth(address)
+                if not address:
+                    logger.error(f"Could not convert address for user {chat_id}")
+                    continue
+            
             last_block = self.db.get_last_block(chat_id)
             if not last_block:
-                last_block = current_block - 100  # Start from 100 blocks ago
+                # Start from 10 blocks ago for new users
+                last_block = max(current_block - 10, 1)
+                self.db.update_last_block(chat_id, last_block)
+                logger.info(f"Initialized last block for user {chat_id}: {last_block}")
+                continue
             
             # Only check confirmed blocks
             end_block = current_block - CONFIRMATIONS
@@ -715,8 +764,14 @@ For issues or questions, please contact the bot administrator.
             if last_block >= end_block:
                 continue
             
+            # Limit range to prevent scanning too many blocks at once
+            start_block = last_block + 1
+            if end_block - start_block > 50:
+                end_block = start_block + 50
+            
             try:
-                transactions = self.iotex_api.get_transactions(address, last_block + 1, end_block)
+                logger.info(f"Scanning blocks {start_block}-{end_block} for user {chat_id}")
+                transactions = self.iotex_api.get_transactions_from_blocks(address, start_block, end_block)
                 
                 for tx in transactions:
                     tx_hash = tx.get('hash')
@@ -731,14 +786,22 @@ For issues or questions, please contact the bot administrator.
                     is_incoming = to_addr == user_addr and from_addr != user_addr
                     is_outgoing = from_addr == user_addr and to_addr != user_addr
                     
+                    # Skip if amount is 0
+                    if tx.get('value', 0) == 0:
+                        self.db.mark_tx_processed(chat_id, tx_hash)
+                        continue
+                    
                     if is_incoming and user['alert_tx_in']:
                         self.send_transaction_alert(chat_id, tx, user_addr, True)
                         self.db.mark_tx_processed(chat_id, tx_hash)
                     elif is_outgoing and user['alert_tx_out']:
                         self.send_transaction_alert(chat_id, tx, user_addr, False)
                         self.db.mark_tx_processed(chat_id, tx_hash)
+                    else:
+                        self.db.mark_tx_processed(chat_id, tx_hash)
                 
                 self.db.update_last_block(chat_id, end_block)
+                logger.info(f"Updated last block for user {chat_id}: {end_block}")
                 
             except Exception as e:
                 logger.error(f"Error monitoring transactions for {chat_id}: {e}")
@@ -746,12 +809,13 @@ For issues or questions, please contact the bot administrator.
 def run_bot():
     """Main bot loop"""
     db = Database(DB_PATH)
-    iotex_api = IoTeXAPI(IOTEX_RPC_URL, IOTEX_GRAPHQL_URL)
+    iotex_api = IoTeXAPI(IOTEX_RPC_URL)
     bot = TelegramBot(db, iotex_api)
     
     logger.info("Bot started successfully!")
     logger.info(f"Polling interval: {POLL_INTERVAL_SEC}s")
     logger.info(f"Confirmations required: {CONFIRMATIONS}")
+    logger.info(f"RPC URL: {IOTEX_RPC_URL}")
     
     last_monitor = 0
     
