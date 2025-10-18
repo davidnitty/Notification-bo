@@ -15,15 +15,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Configuration
-class Config:
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk")
-    IOTEX_RPC_URL = os.getenv("IOTEX_RPC_URL", "https://api.iotex.me/api/graphql")
-    CONFIRMATIONS = int(os.getenv("CONFIRMATIONS", "3"))
-    POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "4"))
-    TIMEZONE = os.getenv("TZ", "Africa/Lagos")
-    
-    TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-    EXPLORER_BASE = "https://iotexscan.io"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7831036263:AAHSisyLSr5bSwfJ2jGXasRfLcRluo2y5gk")
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 class AddressUtils:
     @staticmethod
@@ -50,20 +43,36 @@ class Storage:
     def _init_db(self) -> None:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
+        
+        # Create users table with basic structure
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 chat_id INTEGER PRIMARY KEY,
                 address TEXT NOT NULL,
                 preferences TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                is_active BOOLEAN DEFAULT TRUE,
-                last_alert_sent TEXT DEFAULT NULL,
-                total_alerts INTEGER DEFAULT 0
+                is_active BOOLEAN DEFAULT TRUE
             )
         ''')
+        
+        # Add missing columns if they don't exist
+        self._add_column_if_missing(conn, 'last_alert_sent', 'TEXT DEFAULT NULL')
+        self._add_column_if_missing(conn, 'total_alerts', 'INTEGER DEFAULT 0')
+        
         conn.commit()
         conn.close()
-        logger.info("Database initialized")
+        logger.info("Database initialized with schema updates")
+    
+    def _add_column_if_missing(self, conn, column_name, column_type):
+        """Add a column to the users table if it doesn't exist"""
+        cursor = conn.cursor()
+        try:
+            # Try to select from the column - if it fails, the column doesn't exist
+            cursor.execute(f"SELECT {column_name} FROM users LIMIT 1")
+        except sqlite3.OperationalError:
+            # Column doesn't exist, add it
+            logger.info(f"Adding missing column: {column_name}")
+            cursor.execute(f'ALTER TABLE users ADD COLUMN {column_name} {column_type}')
     
     def save_user(self, chat_id: int, address: str, is_active: bool = True) -> None:
         conn = sqlite3.connect(self.db_path)
@@ -80,26 +89,58 @@ class Storage:
     def get_user(self, chat_id: int):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('SELECT chat_id, address, preferences, last_alert_sent, total_alerts FROM users WHERE chat_id = ?', (chat_id,))
-        row = cursor.fetchone()
+        
+        # Use a safe query that works even if columns are missing
+        try:
+            cursor.execute('SELECT chat_id, address, preferences, last_alert_sent, total_alerts FROM users WHERE chat_id = ?', (chat_id,))
+            row = cursor.fetchone()
+        except sqlite3.OperationalError:
+            # Fallback to basic columns if new columns don't exist yet
+            cursor.execute('SELECT chat_id, address, preferences FROM users WHERE chat_id = ?', (chat_id,))
+            row = cursor.fetchone()
+            if row:
+                row = row + (None, 0)  # Add default values for missing columns
+        
         conn.close()
+        
         if row:
             return {
-                'chat_id': row[0], 'address': row[1], 'preferences': json.loads(row[2]),
-                'last_alert_sent': row[3], 'total_alerts': row[4] or 0
+                'chat_id': row[0], 
+                'address': row[1], 
+                'preferences': json.loads(row[2]),
+                'last_alert_sent': row[3] if len(row) > 3 else None,
+                'total_alerts': row[4] if len(row) > 4 else 0
             }
         return None
     
     def get_all_active_users(self):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('SELECT chat_id, address, preferences, last_alert_sent, total_alerts FROM users WHERE is_active = TRUE')
+        
+        # Use a safe query that works even if columns are missing
+        try:
+            cursor.execute('SELECT chat_id, address, preferences, last_alert_sent, total_alerts FROM users WHERE is_active = TRUE')
+        except sqlite3.OperationalError:
+            # Fallback to basic columns
+            cursor.execute('SELECT chat_id, address, preferences FROM users WHERE is_active = TRUE')
+        
         users = []
         for row in cursor.fetchall():
-            users.append({
-                'chat_id': row[0], 'address': row[1], 'preferences': json.loads(row[2]),
-                'last_alert_sent': row[3], 'total_alerts': row[4] or 0
-            })
+            user_data = {
+                'chat_id': row[0], 
+                'address': row[1], 
+                'preferences': json.loads(row[2])
+            }
+            # Add optional columns if they exist
+            if len(row) > 3:
+                user_data['last_alert_sent'] = row[3]
+            if len(row) > 4:
+                user_data['total_alerts'] = row[4]
+            else:
+                user_data['total_alerts'] = 0
+                
+            users.append(user_data)
+        
         conn.close()
         return users
     
@@ -114,8 +155,16 @@ class Storage:
     def update_last_alert(self, chat_id: int):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute('UPDATE users SET last_alert_sent = ?, total_alerts = COALESCE(total_alerts, 0) + 1 WHERE chat_id = ?', 
-                      (datetime.now().isoformat(), chat_id))
+        
+        # Safe update that works even if columns don't exist yet
+        try:
+            cursor.execute('UPDATE users SET last_alert_sent = ?, total_alerts = COALESCE(total_alerts, 0) + 1 WHERE chat_id = ?', 
+                          (datetime.now().isoformat(), chat_id))
+        except sqlite3.OperationalError:
+            # If columns don't exist, just update what we can
+            cursor.execute('UPDATE users SET last_alert_sent = ? WHERE chat_id = ?', 
+                          (datetime.now().isoformat(), chat_id))
+        
         conn.commit()
         conn.close()
 
@@ -145,12 +194,15 @@ class IoTeXMonitor:
             if not user.get('address'):
                 return
             
-            # Cooldown check
+            # Cooldown check (skip if last_alert_sent doesn't exist yet)
             last_alert = user.get('last_alert_sent')
             if last_alert:
-                last_alert_time = datetime.fromisoformat(last_alert)
-                if (datetime.now() - last_alert_time).total_seconds() < self.alert_cooldown:
-                    return
+                try:
+                    last_alert_time = datetime.fromisoformat(last_alert)
+                    if (datetime.now() - last_alert_time).total_seconds() < self.alert_cooldown:
+                        return
+                except:
+                    pass  # If date parsing fails, continue anyway
             
             # 8% chance per check for alerts
             if random.random() < 0.08:
@@ -168,7 +220,6 @@ class IoTeXMonitor:
     
     def send_transaction_alert(self, user, direction):
         try:
-            bot = TelegramBot()
             amount = round(random.uniform(1, 10000), 0)
             
             # Generate a fake transaction hash
@@ -196,7 +247,7 @@ class IoTeXMonitor:
 💰 Amount: {amount:.0f} IOTX
 🔗 Transaction: [View on Explorer]({explorer_link})"""
             
-            if bot.send_message(user['chat_id'], message):
+            if send_telegram_message(user['chat_id'], message):
                 self.storage.update_last_alert(user['chat_id'])
                 
         except Exception as e:
@@ -204,7 +255,6 @@ class IoTeXMonitor:
     
     def send_staking_alert(self, user):
         try:
-            bot = TelegramBot()
             reward = round(random.uniform(100, 5000), 0)
             
             # Validator names
@@ -232,68 +282,33 @@ class IoTeXMonitor:
 🏛 Validator: {validator}
 🔗 Transaction: [View on Explorer]({explorer_link})"""
             
-            if bot.send_message(user['chat_id'], message):
+            if send_telegram_message(user['chat_id'], message):
                 self.storage.update_last_alert(user['chat_id'])
                 
         except Exception as e:
             logger.error(f"Staking alert error: {e}")
 
-class TelegramBot:
-    def __init__(self):
-        self.storage = Storage()
-        self.base_url = Config.TELEGRAM_API_BASE
+def send_telegram_message(chat_id: int, text: str, parse_mode: str = "Markdown") -> bool:
+    url = f"{TELEGRAM_API_BASE}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode
+    }
     
-    def send_message(self, chat_id: int, text: str, parse_mode: str = "Markdown") -> bool:
-        url = f"{self.base_url}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": parse_mode
-        }
-        
-        try:
-            response = requests.post(url, json=payload, timeout=10)
-            return response.status_code == 200
-        except Exception as e:
-            logger.error(f"Send error: {e}")
-            return False
+    try:
+        response = requests.post(url, json=payload, timeout=10)
+        return response.status_code == 200
+    except Exception as e:
+        logger.error(f"Send error: {e}")
+        return False
+
+def process_telegram_message(chat_id: int, text: str) -> None:
+    storage = Storage()
+    text = text.strip()
+    logger.info(f"Processing: '{text}' from {chat_id}")
     
-    def process_update(self, update: dict) -> None:
-        if "message" not in update:
-            return
-        
-        message = update["message"]
-        chat_id = message["chat"]["id"]
-        text = message.get("text", "").strip()
-        
-        logger.info(f"Processing: '{text}' from {chat_id}")
-        
-        if text.lower() in ['/start', '/start@dustpin_bot']:
-            self.handle_start(chat_id)
-        elif text.lower().startswith('/setaddress'):
-            self.handle_set_address(chat_id, text)
-        elif text.lower() in ['/getaddress', '/getaddress@dustpin_bot']:
-            self.handle_get_address(chat_id)
-        elif text.lower() in ['/unsubscribe', '/unsubscribe@dustpin_bot']:
-            self.handle_unsubscribe(chat_id)
-        elif text.lower() in ['/help', '/help@dustpin_bot']:
-            self.handle_help(chat_id)
-        elif text.lower() in ['/watchlist', '/watchlist@dustpin_bot']:
-            self.handle_watchlist(chat_id)
-        elif text.lower() in ['/testalert', '/testalert@dustpin_bot']:
-            self.handle_test_alert(chat_id)
-        elif text.lower() in ['/status', '/status@dustpin_bot']:
-            self.handle_status(chat_id)
-        elif text.lower() in ['/stats', '/stats@dustpin_bot']:
-            self.handle_stats(chat_id)
-        else:
-            is_valid, normalized_address = AddressUtils.validate_address(text)
-            if is_valid:
-                self.handle_address_input(chat_id, text)
-            else:
-                self.send_message(chat_id, "❌ Unknown command. Use /help")
-    
-    def handle_start(self, chat_id: int) -> None:
+    if text.lower() in ['/start', '/start@dustpin_bot']:
         welcome = """🤖 *IoTeX Alert System*
 
 Track your IoTeX transactions in real-time:
@@ -304,21 +319,27 @@ Track your IoTeX transactions in real-time:
 
 *Quick Start:*
 Send your IoTeX address to begin monitoring!"""
-        self.send_message(chat_id, welcome)
+        send_telegram_message(chat_id, welcome)
     
-    def handle_address_input(self, chat_id: int, address: str) -> None:
+    elif text.lower().startswith('/setaddress'):
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram_message(chat_id, "📍 Usage: `/setaddress YOUR_ADDRESS`")
+            return
+        
+        address = parts[1]
         is_valid, normalized_address = AddressUtils.validate_address(address)
         
         if not is_valid:
-            self.send_message(chat_id, "❌ Invalid format. Use: `io1...` or `0x...`")
+            send_telegram_message(chat_id, "❌ Invalid format. Use: `io1...` or `0x...`")
             return
         
-        if self.storage.is_address_in_watchlist(normalized_address):
+        if storage.is_address_in_watchlist(normalized_address):
             short_addr = AddressUtils.shorten_address(normalized_address)
-            self.send_message(chat_id, f"⚠️ Already watching:\n`{short_addr}`")
+            send_telegram_message(chat_id, f"⚠️ Already watching:\n`{short_addr}`")
             return
         
-        self.storage.save_user(chat_id, normalized_address)
+        storage.save_user(chat_id, normalized_address)
         short_addr = AddressUtils.shorten_address(normalized_address)
         
         response = f"""✅ *Address Added to Watchlist*
@@ -331,19 +352,12 @@ You will now receive alerts for:
 • 🎉 Staking rewards
 
 Monitoring active!"""
-        self.send_message(chat_id, response)
+        send_telegram_message(chat_id, response)
     
-    def handle_set_address(self, chat_id: int, text: str) -> None:
-        parts = text.split()
-        if len(parts) < 2:
-            self.send_message(chat_id, "📍 Usage: `/setaddress YOUR_ADDRESS`")
-            return
-        self.handle_address_input(chat_id, parts[1])
-    
-    def handle_watchlist(self, chat_id: int) -> None:
-        user = self.storage.get_user(chat_id)
+    elif text.lower() in ['/watchlist', '/watchlist@dustpin_bot']:
+        user = storage.get_user(chat_id)
         if not user:
-            self.send_message(chat_id, "📋 No addresses. Send an address!")
+            send_telegram_message(chat_id, "📋 No addresses. Send an address!")
             return
         
         short_addr = AddressUtils.shorten_address(user['address'])
@@ -356,37 +370,9 @@ Monitoring active!"""
 📊 Alerts: {total_alerts}
 🕒 Last: {last_alert}
 🟢 Status: Active"""
-        self.send_message(chat_id, response)
+        send_telegram_message(chat_id, response)
     
-    def handle_get_address(self, chat_id: int) -> None:
-        user = self.storage.get_user(chat_id)
-        if not user:
-            self.send_message(chat_id, "❌ No address set!")
-            return
-        short_addr = AddressUtils.shorten_address(user['address'])
-        self.send_message(chat_id, f"📍 `{short_addr}`")
-    
-    def handle_unsubscribe(self, chat_id: int) -> None:
-        user = self.storage.get_user(chat_id)
-        if user:
-            self.storage.save_user(chat_id, user['address'], False)
-        self.send_message(chat_id, "🔔 Unsubscribed. Send address to resubscribe.")
-    
-    def handle_help(self, chat_id: int) -> None:
-        help_text = """🆘 *Commands*
-
-/start - Welcome message
-/setaddress <addr> - Add address  
-/watchlist - View status
-/getaddress - Show address
-/unsubscribe - Stop alerts
-/testalert - Test notification
-/status - System status
-/stats - Your statistics
-/help - This message"""
-        self.send_message(chat_id, help_text)
-    
-    def handle_test_alert(self, chat_id: int) -> None:
+    elif text.lower() in ['/testalert', '/testalert@dustpin_bot']:
         amount = 4683
         fake_tx_hash = ''.join(random.choices('0123456789abcdef', k=64))
         explorer_link = f"https://iotexscan.io/tx/{fake_tx_hash}"
@@ -405,10 +391,10 @@ Monitoring active!"""
 💰 Amount: 750 IOTX
 🏛 Validator: {validator}
 🔗 Transaction: [View on Explorer]({explorer_link})"""
-        self.send_message(chat_id, test_message)
+        send_telegram_message(chat_id, test_message)
     
-    def handle_status(self, chat_id: int) -> None:
-        users = self.storage.get_all_active_users()
+    elif text.lower() in ['/status', '/status@dustpin_bot']:
+        users = storage.get_all_active_users()
         total_alerts = sum(user.get('total_alerts', 0) for user in users)
         
         status_message = f"""📊 *System Status*
@@ -418,28 +404,94 @@ Monitoring active!"""
 👥 Users: {len(users)}
 🔔 Alerts: {total_alerts}
 🌐 Host: Railway"""
-        self.send_message(chat_id, status_message)
+        send_telegram_message(chat_id, status_message)
     
-    def handle_stats(self, chat_id: int) -> None:
-        user = self.storage.get_user(chat_id)
-        if not user:
-            self.send_message(chat_id, "❌ No data. Send an address!")
-            return
-        
-        total_alerts = user.get('total_alerts', 0)
-        last_alert = user.get('last_alert_sent', 'Never')
-        
-        stats_message = f"""📈 *Your Statistics*
+    elif text.lower() in ['/help', '/help@dustpin_bot']:
+        help_text = """🆘 *Commands*
 
-📊 Total Alerts: {total_alerts}
-🕒 Last Alert: {last_alert}
-🟢 Status: Active"""
-        self.send_message(chat_id, stats_message)
+/start - Welcome message
+/setaddress <addr> - Add address  
+/watchlist - View status
+/testalert - Test notification
+/status - System status
+/help - This message"""
+        send_telegram_message(chat_id, help_text)
+    
+    else:
+        is_valid, normalized_address = AddressUtils.validate_address(text)
+        if is_valid:
+            # Handle direct address input
+            if storage.is_address_in_watchlist(normalized_address):
+                short_addr = AddressUtils.shorten_address(normalized_address)
+                send_telegram_message(chat_id, f"⚠️ Already watching:\n`{short_addr}`")
+                return
+            
+            storage.save_user(chat_id, normalized_address)
+            short_addr = AddressUtils.shorten_address(normalized_address)
+            
+            response = f"""✅ *Address Added to Watchlist*
 
-# Flask App for Railway
+`{short_addr}`
+
+You will now receive alerts for:
+• 📥 Incoming transactions
+• 📤 Outgoing transactions  
+• 🎉 Staking rewards
+
+Monitoring active!"""
+            send_telegram_message(chat_id, response)
+        else:
+            send_telegram_message(chat_id, "❌ Unknown command. Use /help")
+
+def poll_telegram_updates():
+    """Poll for Telegram updates - works without webhooks"""
+    offset = None
+    
+    logger.info("🤖 Starting IoTeX Bot (POLLING MODE)...")
+    
+    while True:
+        try:
+            url = f"{TELEGRAM_API_BASE}/getUpdates"
+            params = {'timeout': 30}
+            if offset:
+                params['offset'] = offset
+                
+            response = requests.get(url, params=params, timeout=35)
+            data = response.json()
+            
+            if data.get('ok'):
+                for update in data['result']:
+                    offset = update['update_id'] + 1
+                    
+                    if 'message' in update:
+                        message = update['message']
+                        chat_id = message['chat']['id']
+                        text = message.get('text', '').strip()
+                        
+                        if text:
+                            logger.info(f"📨 From {chat_id}: {text}")
+                            process_telegram_message(chat_id, text)
+            
+            time.sleep(1)
+            
+        except Exception as e:
+            logger.error(f"Polling error: {e}")
+            time.sleep(5)
+
+def start_monitoring():
+    """Start monitoring in background"""
+    monitor = IoTeXMonitor()
+    logger.info("🚀 Starting IoTeX monitoring (4s intervals)...")
+    while True:
+        try:
+            monitor.check_all_users()
+            time.sleep(4)
+        except Exception as e:
+            logger.error(f"Monitoring error: {e}")
+            time.sleep(2)
+
+# Flask app for health checks and webhook
 app = Flask(__name__)
-bot = TelegramBot()
-monitor = IoTeXMonitor()
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -448,7 +500,15 @@ def webhook():
     logger.info("Received webhook update")
     
     try:
-        bot.process_update(update)
+        if "message" in update:
+            message = update["message"]
+            chat_id = message["chat"]["id"]
+            text = message.get("text", "").strip()
+            
+            if text:
+                logger.info(f"📨 From {chat_id}: {text}")
+                process_telegram_message(chat_id, text)
+        
         return jsonify({"status": "ok"})
     except Exception as e:
         logger.error(f"Webhook error: {e}")
@@ -458,7 +518,7 @@ def webhook():
 def set_webhook():
     """Auto-set webhook on Railway"""
     webhook_url = f"https://{request.host}/webhook"
-    url = f"{Config.TELEGRAM_API_BASE}/setWebhook"
+    url = f"{TELEGRAM_API_BASE}/setWebhook"
     payload = {"url": webhook_url}
     
     try:
@@ -474,52 +534,20 @@ def set_webhook():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.route('/', methods=['GET'])
+@app.route('/')
 def home():
-    return jsonify({
-        "status": "running", 
-        "service": "iotex-alert-bot",
-        "version": "2.0.0",
-        "platform": "Railway",
-        "monitoring_interval": "4 seconds"
-    })
+    return jsonify({"status": "running", "service": "iotex-alert-bot"})
 
-@app.route('/healthz', methods=['GET'])
+@app.route('/healthz')
 def health_check():
     return jsonify({"status": "healthy"})
 
-def start_monitoring():
-    """Start monitoring in background"""
-    logger.info("🚀 Starting IoTeX monitoring on Railway (4s intervals)...")
-    while True:
-        try:
-            monitor.check_all_users()
-            time.sleep(4)
-        except Exception as e:
-            logger.error(f"Monitoring error: {e}")
-            time.sleep(2)
-
-def main():
-    """Main application entry point"""
-    # Start monitoring thread
+if __name__ == '__main__':
+    # Start monitoring in background thread
     monitor_thread = Thread(target=start_monitoring, daemon=True)
     monitor_thread.start()
     
-    # Auto-set webhook on startup
-    try:
-        with app.app_context():
-            webhook_url = f"https://{os.getenv('RAILWAY_STATIC_URL', 'localhost')}/webhook"
-            if not webhook_url.startswith("https://localhost"):
-                response = requests.post(f"{Config.TELEGRAM_API_BASE}/setWebhook", json={"url": webhook_url})
-                if response.json().get('ok'):
-                    logger.info(f"✅ Webhook auto-configured: {webhook_url}")
-    except Exception as e:
-        logger.info(f"Webhook setup: {e}")
-    
-    # Start Flask app
+    # Start Flask app for Railway health checks and webhook
     port = int(os.getenv('PORT', 8080))
     logger.info(f"🌐 Starting IoTeX Bot on port {port}")
     app.run(host='0.0.0.0', port=port, debug=False)
-
-if __name__ == '__main__':
-    main()
